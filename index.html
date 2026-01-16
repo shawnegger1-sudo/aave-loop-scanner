@@ -2,12 +2,16 @@
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Aave Loop Scanner</title>
 </head>
-<body style="font-family:Arial; padding:20px;">
-  <h2>Aave Loop Scanner</h2>
-  <button onclick="run()">Run analysis</button>
-  <pre id="out" style="margin-top:15px;"></pre>
+<body style="font-family:Arial, sans-serif; padding:20px;">
+  <h2>Aave Loop Scanner (Ethereum mainnet)</h2>
+  <p>Click the button to fetch Aave data and compute a simple 3x same-asset loop net APY.</p>
+
+  <button onclick="run()" style="padding:10px 14px; cursor:pointer;">Run analysis</button>
+
+  <pre id="out" style="margin-top:15px; white-space:pre-wrap; background:#f6f8fa; padding:12px; border-radius:8px;"></pre>
 
 <script>
 async function run() {
@@ -38,32 +42,69 @@ async function run() {
     });
 
     const json = await res.json();
-    const L = 3;
+
+    // If GraphQL returns errors, show them clearly
+    if (json.errors && json.errors.length) {
+      out.textContent =
+        "GraphQL error(s):\n\n" +
+        json.errors.map(e => e.message).join("\n") +
+        "\n\nFull response:\n" + JSON.stringify(json, null, 2);
+      return;
+    }
+
+    const markets = json.data?.markets;
+    if (!markets) {
+      out.textContent =
+        "No markets returned.\n\nFull response:\n" +
+        JSON.stringify(json, null, 2);
+      return;
+    }
+
+    const L = 3; // 3x leverage
     let rows = [];
 
-    for (const m of json.data.markets) {
-      for (const s of m.supplyReserves) {
+    for (const m of markets) {
+      for (const s of (m.supplyReserves || [])) {
         const sApy = Number(s.supplyInfo?.apy);
         if (!isFinite(sApy)) continue;
 
-        for (const b of m.borrowReserves) {
-          if (b.underlyingToken.symbol !== s.underlyingToken.symbol) continue;
+        for (const b of (m.borrowReserves || [])) {
+          // same-asset only
+          if (b.underlyingToken?.symbol !== s.underlyingToken?.symbol) continue;
+
           const bApy = Number(b.borrowInfo?.apy);
           if (!isFinite(bApy)) continue;
 
           const net = sApy * L - bApy * (L - 1);
-          rows.push(`${m.name} | ${s.underlyingToken.symbol} | ${(net*100).toFixed(2)}%`);
+          rows.push({
+            market: m.name,
+            asset: s.underlyingToken.symbol,
+            net,
+            supplyApy: sApy,
+            borrowApy: bApy
+          });
         }
       }
     }
 
-    rows.sort((a,b)=>parseFloat(b.split("%")[0])-parseFloat(a.split("%")[0]));
-    out.textContent = "Top 15 same-asset loops (3x):\n\n" + rows.slice(0,15).join("\n");
+    rows.sort((a,b)=>b.net-a.net);
+
+    if (!rows.length) {
+      out.textContent = "No same-asset loop candidates found (with APY fields present).";
+      return;
+    }
+
+    out.textContent =
+      "Top 15 same-asset loops (3x) — simple net APY model:\n\n" +
+      rows.slice(0,15).map(r =>
+        `${r.market} | ${r.asset} | net ${(r.net*100).toFixed(2)}% (s ${(r.supplyApy*100).toFixed(2)}% / b ${(r.borrowApy*100).toFixed(2)}%)`
+      ).join("\n");
 
   } catch (e) {
-    out.textContent = "Error: " + e.message;
+    out.textContent = "Error (network/browser): " + e.message;
   }
 }
 </script>
+
 </body>
 </html>
