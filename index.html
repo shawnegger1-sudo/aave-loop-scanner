@@ -9,7 +9,7 @@
 
 <h2>Aave Loop Scanner (Ethereum)</h2>
 <p>
-  One button. Uses DeFiLlama public API (no GraphQL).
+  One button. Uses DeFiLlama lending API (stable, public).
   Same-asset loops, 3× leverage.
 </p>
 
@@ -32,34 +32,34 @@ async function run() {
 
   try {
     const res = await fetch("https://yields.llama.fi/lendBorrow");
-    const json = await res.json();
+    const rows = await res.json();
 
-    if (!json || !json.data) {
-      out.textContent = "Unexpected response:\n" + JSON.stringify(json, null, 2);
+    if (!Array.isArray(rows)) {
+      out.textContent =
+        "Unexpected response (not an array):\n\n" +
+        JSON.stringify(rows, null, 2);
       return;
     }
 
-    // Aave V3 on Ethereum only
-    const rows = json.data.filter(r =>
+    // Filter: Aave V3, Ethereum, valid borrow + supply
+    const filtered = rows.filter(r =>
       r.project === "aave-v3" &&
       r.chain === "Ethereum" &&
-      r.lendable === true &&
-      r.borrowable === true &&
-      r.apyBase !== null &&
-      r.apyBaseBorrow !== null
+      typeof r.apyBase === "number" &&
+      typeof r.apyBaseBorrow === "number"
     );
 
     const L = 3; // leverage
     const results = [];
 
-    for (const r of rows) {
+    for (const r of filtered) {
       const supplyApy = r.apyBase / 100;
       const borrowApy = r.apyBaseBorrow / 100;
 
       const net = supplyApy * L - borrowApy * (L - 1);
 
       results.push({
-        asset: r.symbol,
+        asset: r.symbol || r.mintedCoin || "UNKNOWN",
         net,
         supplyApy,
         borrowApy
@@ -67,6 +67,11 @@ async function run() {
     }
 
     results.sort((a,b)=>b.net - a.net);
+
+    if (!results.length) {
+      out.textContent = "No valid Aave V3 Ethereum rows found.";
+      return;
+    }
 
     out.textContent =
       "Top same-asset loops (3× leverage)\n\n" +
