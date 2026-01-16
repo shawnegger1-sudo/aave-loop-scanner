@@ -8,13 +8,22 @@
 <body style="font-family:Arial, sans-serif; padding:20px;">
 
 <h2>Aave Loop Scanner (Ethereum)</h2>
-<p>Uses DeFiLlama lending API (stable, public). Same-asset loops, 3× leverage.</p>
+<p>
+  One button. Uses DeFiLlama public API (no GraphQL).
+  Same-asset loops, 3× leverage.
+</p>
 
 <button onclick="run()" style="padding:10px 14px; font-size:16px;">
   Run analysis
 </button>
 
-<pre id="out" style="margin-top:15px; white-space:pre-wrap; background:#f6f8fa; padding:12px; border-radius:8px;"></pre>
+<pre id="out" style="
+  margin-top:15px;
+  white-space:pre-wrap;
+  background:#f6f8fa;
+  padding:12px;
+  border-radius:8px;
+"></pre>
 
 <script>
 async function run() {
@@ -26,18 +35,18 @@ async function run() {
     const json = await res.json();
 
     if (!json || !json.data) {
-      out.textContent = "No data returned:\n" + JSON.stringify(json, null, 2);
+      out.textContent = "Unexpected response:\n" + JSON.stringify(json, null, 2);
       return;
     }
 
-    // Filter Aave V3 Ethereum only
+    // Aave V3 on Ethereum only
     const rows = json.data.filter(r =>
       r.project === "aave-v3" &&
       r.chain === "Ethereum" &&
-      r.borrowable === true &&
       r.lendable === true &&
-      r.apyBaseBorrow !== null &&
-      r.apyBase !== null
+      r.borrowable === true &&
+      r.apyBase !== null &&
+      r.apyBaseBorrow !== null
     );
 
     const L = 3; // leverage
@@ -57,7 +66,7 @@ async function run() {
       });
     }
 
-    results.sort((a,b)=>b.net-a.net);
+    results.sort((a,b)=>b.net - a.net);
 
     out.textContent =
       "Top same-asset loops (3× leverage)\n\n" +
