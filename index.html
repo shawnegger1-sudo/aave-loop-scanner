@@ -1,15 +1,15 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <title>Aave Loop Scanner (Working)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <title>Aave Loop Scanner (Finally Working)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
 </head>
 
-<body style="font-family: Arial, sans-serif; padding: 20px;">
-  <h2>Aave Loop Scanner</h2>
+<body style="font-family:Arial, sans-serif; padding:20px;">
+  <h2>Aave Loop Scanner — Ethereum</h2>
   <div style="color:#555; margin-bottom:10px;">
-    Version: <b>2.0</b> — DeFiLlama /yields/pools + /yields/poolsBorrow (no GraphQL)
+    Version <b>3.0</b> — DeFiLlama <code>/yields/pools</code> (Aave filter fixed)
   </div>
 
   <div style="margin-bottom:10px;">
@@ -18,17 +18,6 @@
       <option value="2">2x</option>
       <option value="3" selected>3x</option>
       <option value="4">4x</option>
-      <option value="5">5x</option>
-    </select>
-
-    Chain:
-    <select id="chain">
-      <option value="Ethereum" selected>Ethereum</option>
-      <option value="Arbitrum">Arbitrum</option>
-      <option value="Optimism">Optimism</option>
-      <option value="Base">Base</option>
-      <option value="Polygon">Polygon</option>
-      <option value="Avalanche">Avalanche</option>
     </select>
 
     <button onclick="run()" style="padding:10px 14px; font-size:16px; cursor:pointer; margin-left:10px;">
@@ -45,51 +34,83 @@
   "></pre>
 
 <script>
-const BASE = "https://yields.llama.fi"; // public host for yield endpoints
-
-async function fetchJson(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  return await res.json();
-}
-
-function unwrapData(x) {
-  // DeFiLlama often returns {status:"success", data:[...]}
-  // but some mirrors return [...]
-  if (Array.isArray(x)) return x;
-  if (x && Array.isArray(x.data)) return x.data;
-  return null;
-}
-
-function key(project, chain, symbol) {
-  return `${project}||${chain}||${symbol}`.toLowerCase();
-}
-
-function pct(n) {
-  return (n * 100).toFixed(2) + "%";
-}
-
 async function run() {
   const out = document.getElementById("out");
   const L = Number(document.getElementById("lev").value);
-  const chain = document.getElementById("chain").value;
 
-  out.textContent = "Fetching supply pools...";
-  let poolsRaw, borrowRaw;
+  out.textContent = "Fetching DeFiLlama pools...";
 
   try {
-    poolsRaw = await fetchJson(`${BASE}/pools`);       // supply APYs
-  } catch (e) {
-    out.textContent = `Error fetching ${BASE}/pools:\n${e.message}`;
-    return;
-  }
+    const res = await fetch("https://yields.llama.fi/pools", { cache: "no-store" });
+    const json = await res.json();
 
-  out.textContent = "Fetching borrow pools...";
-  try {
-    borrowRaw = await fetchJson(`${BASE}/poolsBorrow`); // borrow APYs
-  } catch (e) {
-    out.textContent = `Error fetching ${BASE}/poolsBorrow:\n${e.message}`;
-    return;
-  }
+    if (!json || !Array.isArray(json.data)) {
+      out.textContent = "Unexpected response:\n" + JSON.stringify(json, null, 2);
+      return;
+    }
 
-  const pools = unwrapData(poolsRaw);
-  const borrows = unw
+    // IMPORTANT FIX:
+    // DeFiLlama uses many labels for Aave V3.
+    // We match project names that CONTAIN 'aave'.
+    const rows = json.data.filter(r =>
+      r.chain === "Ethereum" &&
+      typeof r.project === "string" &&
+      r.project.toLowerCase().includes("aave") &&
+      typeof r.apyBase === "number" &&
+      typeof r.apyBaseBorrow === "number"
+    );
+
+    if (!rows.length) {
+      out.textContent =
+        "No Aave pools matched.\n\n" +
+        "Debug info:\n" +
+        `Total pools: ${json.data.length}\n` +
+        `Ethereum pools: ${json.data.filter(r => r.chain === "Ethereum").length}\n` +
+        `Pools with 'aave' in project name: ${json.data.filter(r =>
+          typeof r.project === "string" && r.project.toLowerCase().includes("aave")
+        ).length}`;
+      return;
+    }
+
+    const results = [];
+
+    for (const r of rows) {
+      const supplyApy = r.apyBase / 100;
+      const borrowApy = r.apyBaseBorrow / 100;
+
+      const net = supplyApy * L - borrowApy * (L - 1);
+
+      results.push({
+        symbol: r.symbol,
+        project: r.project,
+        net,
+        supplyApy,
+        borrowApy,
+        ltv: r.ltv
+      });
+    }
+
+    results.sort((a,b)=>b.net - a.net);
+
+    const lines = [];
+    lines.push(`Aave loops | Ethereum | ${L}x leverage`);
+    lines.push(`Matched pools: ${results.length}`);
+    lines.push("");
+
+    for (const r of results.slice(0,20)) {
+      lines.push(
+        `${r.symbol.padEnd(10)} | net ${(r.net*100).toFixed(2)}% ` +
+        `(s ${(r.supplyApy*100).toFixed(2)}% / b ${(r.borrowApy*100).toFixed(2)}%)`
+      );
+    }
+
+    out.textContent = lines.join("\n");
+
+  } catch (e) {
+    out.textContent = "Error:\n" + e.message;
+  }
+}
+</script>
+
+</body>
+</html>
