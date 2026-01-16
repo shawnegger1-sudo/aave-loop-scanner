@@ -1,88 +1,95 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
   <title>Aave Loop Scanner (Working)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
 </head>
 
-<body style="font-family:Arial, sans-serif; padding:20px;">
-  <h2>Aave Loop Scanner (Ethereum)</h2>
+<body style="font-family: Arial, sans-serif; padding: 20px;">
+  <h2>Aave Loop Scanner</h2>
   <div style="color:#555; margin-bottom:10px;">
-    Version <b>1.0</b> — DeFiLlama POOLS API
+    Version: <b>2.0</b> — DeFiLlama /yields/pools + /yields/poolsBorrow (no GraphQL)
   </div>
 
-  <button onclick="run()" style="padding:10px 14px; font-size:16px; cursor:pointer;">
-    Run analysis
-  </button>
+  <div style="margin-bottom:10px;">
+    Leverage:
+    <select id="lev">
+      <option value="2">2x</option>
+      <option value="3" selected>3x</option>
+      <option value="4">4x</option>
+      <option value="5">5x</option>
+    </select>
+
+    Chain:
+    <select id="chain">
+      <option value="Ethereum" selected>Ethereum</option>
+      <option value="Arbitrum">Arbitrum</option>
+      <option value="Optimism">Optimism</option>
+      <option value="Base">Base</option>
+      <option value="Polygon">Polygon</option>
+      <option value="Avalanche">Avalanche</option>
+    </select>
+
+    <button onclick="run()" style="padding:10px 14px; font-size:16px; cursor:pointer; margin-left:10px;">
+      Run analysis
+    </button>
+  </div>
 
   <pre id="out" style="
-    margin-top:15px;
-    white-space:pre-wrap;
-    background:#f6f8fa;
-    padding:12px;
-    border-radius:8px;
+    margin-top: 12px;
+    white-space: pre-wrap;
+    background: #f6f8fa;
+    padding: 12px;
+    border-radius: 8px;
   "></pre>
 
 <script>
+const BASE = "https://yields.llama.fi"; // public host for yield endpoints
+
+async function fetchJson(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  return await res.json();
+}
+
+function unwrapData(x) {
+  // DeFiLlama often returns {status:"success", data:[...]}
+  // but some mirrors return [...]
+  if (Array.isArray(x)) return x;
+  if (x && Array.isArray(x.data)) return x.data;
+  return null;
+}
+
+function key(project, chain, symbol) {
+  return `${project}||${chain}||${symbol}`.toLowerCase();
+}
+
+function pct(n) {
+  return (n * 100).toFixed(2) + "%";
+}
+
 async function run() {
   const out = document.getElementById("out");
-  out.textContent = "Fetching DeFiLlama pools data...";
+  const L = Number(document.getElementById("lev").value);
+  const chain = document.getElementById("chain").value;
+
+  out.textContent = "Fetching supply pools...";
+  let poolsRaw, borrowRaw;
 
   try {
-    const res = await fetch("https://yields.llama.fi/pools", { cache: "no-store" });
-    const json = await res.json();
-
-    if (!json || !Array.isArray(json.data)) {
-      out.textContent = "Unexpected response:\n" + JSON.stringify(json, null, 2);
-      return;
-    }
-
-    // Filter Aave V3 on Ethereum with both supply & borrow APYs
-    const rows = json.data.filter(r =>
-      r.project === "aave-v3" &&
-      r.chain === "Ethereum" &&
-      typeof r.apyBase === "number" &&
-      typeof r.apyBaseBorrow === "number"
-    );
-
-    if (!rows.length) {
-      out.textContent = "No valid Aave V3 Ethereum pools found.";
-      return;
-    }
-
-    const L = 3; // leverage
-    const results = [];
-
-    for (const r of rows) {
-      const supplyApy = r.apyBase / 100;
-      const borrowApy = r.apyBaseBorrow / 100;
-
-      const net = supplyApy * L - borrowApy * (L - 1);
-
-      results.push({
-        asset: r.symbol,
-        net,
-        supplyApy,
-        borrowApy,
-        ltv: r.ltv
-      });
-    }
-
-    results.sort((a,b)=>b.net - a.net);
-
-    out.textContent =
-      `Top same-asset loops (3× leverage)\n\n` +
-      results.slice(0,15).map(r =>
-        `${r.asset} | net ${(r.net*100).toFixed(2)}% ` +
-        `(s ${(r.supplyApy*100).toFixed(2)}% / b ${(r.borrowApy*100).toFixed(2)}%, LTV ${Math.round(r.ltv*100)}%)`
-      ).join("\n");
-
+    poolsRaw = await fetchJson(`${BASE}/pools`);       // supply APYs
   } catch (e) {
-    out.textContent = "Error:\n" + e.message;
+    out.textContent = `Error fetching ${BASE}/pools:\n${e.message}`;
+    return;
   }
-}
-</script>
 
-</body>
-</html>
+  out.textContent = "Fetching borrow pools...";
+  try {
+    borrowRaw = await fetchJson(`${BASE}/poolsBorrow`); // borrow APYs
+  } catch (e) {
+    out.textContent = `Error fetching ${BASE}/poolsBorrow:\n${e.message}`;
+    return;
+  }
+
+  const pools = unwrapData(poolsRaw);
+  const borrows = unw
