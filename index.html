@@ -2,14 +2,14 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Aave Loop Scanner (Stable)</title>
+  <title>Aave Loop Scanner (Working)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
 </head>
 
 <body style="font-family:Arial, sans-serif; padding:20px;">
   <h2>Aave Loop Scanner (Ethereum)</h2>
   <div style="color:#555; margin-bottom:10px;">
-    Version: <b>0.3</b> (DeFiLlama REST API, no GraphQL)
+    Version <b>1.0</b> — DeFiLlama POOLS API
   </div>
 
   <button onclick="run()" style="padding:10px 14px; font-size:16px; cursor:pointer;">
@@ -27,34 +27,62 @@
 <script>
 async function run() {
   const out = document.getElementById("out");
-  out.textContent = "Fetching DeFiLlama lending data...";
+  out.textContent = "Fetching DeFiLlama pools data...";
 
   try {
-    const res = await fetch("https://yields.llama.fi/lendBorrow", { cache: "no-store" });
-    const rows = await res.json();
+    const res = await fetch("https://yields.llama.fi/pools", { cache: "no-store" });
+    const json = await res.json();
 
-    // IMPORTANT: DeFiLlama returns an ARRAY directly (not { data: [...] })
-    if (!Array.isArray(rows)) {
-      out.textContent =
-        "Unexpected response (NOT an array):\n\n" +
-        JSON.stringify(rows, null, 2);
+    if (!json || !Array.isArray(json.data)) {
+      out.textContent = "Unexpected response:\n" + JSON.stringify(json, null, 2);
       return;
     }
 
-    // Show a small debug header so you can confirm the code path is correct
-    const header =
-      `Received ${rows.length.toLocaleString()} rows from DeFiLlama.\n` +
-      `Filtering: project=aave-v3, chain=Ethereum, has apyBase & apyBaseBorrow.\n\n`;
-
-    // Filter: Aave V3 on Ethereum, require both supply & borrow base APYs
-    const filtered = rows.filter(r =>
+    // Filter Aave V3 on Ethereum with both supply & borrow APYs
+    const rows = json.data.filter(r =>
       r.project === "aave-v3" &&
       r.chain === "Ethereum" &&
       typeof r.apyBase === "number" &&
       typeof r.apyBaseBorrow === "number"
     );
 
-    if (!filtered.length) {
-      out.textContent =
-        header +
-        "No matching Aav
+    if (!rows.length) {
+      out.textContent = "No valid Aave V3 Ethereum pools found.";
+      return;
+    }
+
+    const L = 3; // leverage
+    const results = [];
+
+    for (const r of rows) {
+      const supplyApy = r.apyBase / 100;
+      const borrowApy = r.apyBaseBorrow / 100;
+
+      const net = supplyApy * L - borrowApy * (L - 1);
+
+      results.push({
+        asset: r.symbol,
+        net,
+        supplyApy,
+        borrowApy,
+        ltv: r.ltv
+      });
+    }
+
+    results.sort((a,b)=>b.net - a.net);
+
+    out.textContent =
+      `Top same-asset loops (3× leverage)\n\n` +
+      results.slice(0,15).map(r =>
+        `${r.asset} | net ${(r.net*100).toFixed(2)}% ` +
+        `(s ${(r.supplyApy*100).toFixed(2)}% / b ${(r.borrowApy*100).toFixed(2)}%, LTV ${Math.round(r.ltv*100)}%)`
+      ).join("\n");
+
+  } catch (e) {
+    out.textContent = "Error:\n" + e.message;
+  }
+}
+</script>
+
+</body>
+</html>
