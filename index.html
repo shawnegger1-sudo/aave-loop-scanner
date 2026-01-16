@@ -2,22 +2,33 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Aave Loop Scanner (Finally Working)</title>
+  <title>Aave Loop Scanner (Working)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
 </head>
 
 <body style="font-family:Arial, sans-serif; padding:20px;">
-  <h2>Aave Loop Scanner — Ethereum</h2>
+  <h2>Aave Loop Scanner</h2>
   <div style="color:#555; margin-bottom:10px;">
-    Version <b>3.0</b> — DeFiLlama <code>/yields/pools</code> (Aave filter fixed)
+    Version <b>4.0</b> — DeFiLlama supply+borrow join (no GraphQL)
   </div>
 
   <div style="margin-bottom:10px;">
+    Chain:
+    <select id="chain">
+      <option value="Ethereum" selected>Ethereum</option>
+      <option value="Arbitrum">Arbitrum</option>
+      <option value="Optimism">Optimism</option>
+      <option value="Base">Base</option>
+      <option value="Polygon">Polygon</option>
+      <option value="Avalanche">Avalanche</option>
+    </select>
+
     Leverage:
     <select id="lev">
       <option value="2">2x</option>
       <option value="3" selected>3x</option>
       <option value="4">4x</option>
+      <option value="5">5x</option>
     </select>
 
     <button onclick="run()" style="padding:10px 14px; font-size:16px; cursor:pointer; margin-left:10px;">
@@ -34,81 +45,151 @@
   "></pre>
 
 <script>
+function unwrapData(x) {
+  // Accept either: {status:"success", data:[...]} OR [...] directly
+  if (Array.isArray(x)) return x;
+  if (x && Array.isArray(x.data)) return x.data;
+  return null;
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  const txt = await res.text();
+  try { return JSON.parse(txt); }
+  catch { return { __parseError: true, raw: txt.slice(0, 400) }; }
+}
+
+function key(project, chain, symbol) {
+  return `${(project||"").toLowerCase()}||${(chain||"").toLowerCase()}||${(symbol||"").toLowerCase()}`;
+}
+
+function pct(x) {
+  return (x * 100).toFixed(2) + "%";
+}
+
+function isAaveProject(p) {
+  // Robust: catches "aave-v3", "Aave V3", "aave", etc.
+  if (!p || typeof p !== "string") return false;
+  const s = p.toLowerCase();
+  return s.includes("aave");
+}
+
 async function run() {
   const out = document.getElementById("out");
+  const chain = document.getElementById("chain").value;
   const L = Number(document.getElementById("lev").value);
 
-  out.textContent = "Fetching DeFiLlama pools...";
+  out.textContent = "Fetching DeFiLlama supply pools...";
 
-  try {
-    const res = await fetch("https://yields.llama.fi/pools", { cache: "no-store" });
-    const json = await res.json();
+  // Try the free hosts first (these are what DeFiLlama’s yields site uses)
+  const supplyUrls = [
+    "https://yields.llama.fi/pools",
+    "https://yields.llama.fi/yields/pools"
+  ];
+  const borrowUrls = [
+    "https://yields.llama.fi/poolsBorrow",
+    "https://yields.llama.fi/yields/poolsBorrow"
+  ];
 
-    if (!json || !Array.isArray(json.data)) {
-      out.textContent = "Unexpected response:\n" + JSON.stringify(json, null, 2);
-      return;
-    }
+  let supplyRaw = null, borrowRaw = null, supply = null, borrow = null;
 
-    // IMPORTANT FIX:
-    // DeFiLlama uses many labels for Aave V3.
-    // We match project names that CONTAIN 'aave'.
-    const rows = json.data.filter(r =>
-      r.chain === "Ethereum" &&
-      typeof r.project === "string" &&
-      r.project.toLowerCase().includes("aave") &&
-      typeof r.apyBase === "number" &&
-      typeof r.apyBaseBorrow === "number"
-    );
-
-    if (!rows.length) {
-      out.textContent =
-        "No Aave pools matched.\n\n" +
-        "Debug info:\n" +
-        `Total pools: ${json.data.length}\n` +
-        `Ethereum pools: ${json.data.filter(r => r.chain === "Ethereum").length}\n` +
-        `Pools with 'aave' in project name: ${json.data.filter(r =>
-          typeof r.project === "string" && r.project.toLowerCase().includes("aave")
-        ).length}`;
-      return;
-    }
-
-    const results = [];
-
-    for (const r of rows) {
-      const supplyApy = r.apyBase / 100;
-      const borrowApy = r.apyBaseBorrow / 100;
-
-      const net = supplyApy * L - borrowApy * (L - 1);
-
-      results.push({
-        symbol: r.symbol,
-        project: r.project,
-        net,
-        supplyApy,
-        borrowApy,
-        ltv: r.ltv
-      });
-    }
-
-    results.sort((a,b)=>b.net - a.net);
-
-    const lines = [];
-    lines.push(`Aave loops | Ethereum | ${L}x leverage`);
-    lines.push(`Matched pools: ${results.length}`);
-    lines.push("");
-
-    for (const r of results.slice(0,20)) {
-      lines.push(
-        `${r.symbol.padEnd(10)} | net ${(r.net*100).toFixed(2)}% ` +
-        `(s ${(r.supplyApy*100).toFixed(2)}% / b ${(r.borrowApy*100).toFixed(2)}%)`
-      );
-    }
-
-    out.textContent = lines.join("\n");
-
-  } catch (e) {
-    out.textContent = "Error:\n" + e.message;
+  // Fetch supply
+  for (const u of supplyUrls) {
+    const j = await fetchJson(u);
+    const d = unwrapData(j);
+    if (d) { supplyRaw = j; supply = d; break; }
   }
+  if (!supply) {
+    out.textContent =
+      "Could not load supply pools from DeFiLlama.\n\nTried:\n" +
+      supplyUrls.join("\n") +
+      "\n\nLast response:\n" + JSON.stringify(supplyRaw, null, 2);
+    return;
+  }
+
+  out.textContent = "Fetching DeFiLlama borrow pools...";
+
+  // Fetch borrow
+  for (const u of borrowUrls) {
+    const j = await fetchJson(u);
+    const d = unwrapData(j);
+    if (d) { borrowRaw = j; borrow = d; break; }
+  }
+  if (!borrow) {
+    out.textContent =
+      "Could not load borrow pools from DeFiLlama.\n\nTried:\n" +
+      borrowUrls.join("\n") +
+      "\n\nLast response:\n" + JSON.stringify(borrowRaw, null, 2);
+    return;
+  }
+
+  // Filter to Aave + selected chain
+  const supplyAave = supply.filter(r =>
+    r && r.chain === chain && isAaveProject(r.project) && typeof r.symbol === "string" && typeof r.apyBase === "number"
+  );
+
+  const borrowAave = borrow.filter(r =>
+    r && r.chain === chain && isAaveProject(r.project) && typeof r.symbol === "string" && typeof r.apyBaseBorrow === "number"
+  );
+
+  // Build borrow lookup by project+chain+symbol
+  const borrowMap = new Map();
+  for (const b of borrowAave) {
+    borrowMap.set(key(b.project, b.chain, b.symbol), b);
+  }
+
+  // Join and compute same-asset loop net APY
+  const results = [];
+  for (const s of supplyAave) {
+    const b = borrowMap.get(key(s.project, s.chain, s.symbol));
+    if (!b) continue;
+
+    const supplyApy = s.apyBase / 100;
+    const borrowApy = b.apyBaseBorrow / 100;
+    const net = supplyApy * L - borrowApy * (L - 1);
+
+    results.push({
+      project: s.project,
+      symbol: s.symbol,
+      net,
+      supplyApy,
+      borrowApy,
+      ltv: (typeof b.ltv === "number") ? b.ltv : null
+    });
+  }
+
+  results.sort((a,b) => b.net - a.net);
+
+  // Debug if no matches
+  if (!results.length) {
+    // show top project names we saw for Aave on this chain
+    const uniqProjectsSupply = [...new Set(supplyAave.map(x => x.project))].slice(0, 30);
+    const uniqProjectsBorrow = [...new Set(borrowAave.map(x => x.project))].slice(0, 30);
+
+    out.textContent =
+      `No matched Aave supply+borrow pools found for chain=${chain}.\n\n` +
+      `Supply pools (Aave-ish) with apyBase: ${supplyAave.length}\n` +
+      `Borrow pools (Aave-ish) with apyBaseBorrow: ${borrowAave.length}\n\n` +
+      `Sample Aave project labels in SUPPLY:\n- ${uniqProjectsSupply.join("\n- ") || "(none)"}\n\n` +
+      `Sample Aave project labels in BORROW:\n- ${uniqProjectsBorrow.join("\n- ") || "(none)"}\n\n` +
+      `This usually means the project label differs between supply vs borrow (e.g., "aave-v3" vs "aave").\n` +
+      `Next step: join by pool id via /yields/chartLendBorrow/{pool} for a smaller curated set.`;
+    return;
+  }
+
+  const top = results.slice(0, 20);
+  const lines = [];
+  lines.push(`Aave loops | ${chain} | ${L}x leverage`);
+  lines.push(`Matched assets: ${results.length} (showing top ${top.length})`);
+  lines.push("");
+  for (const r of top) {
+    const ltvTxt = (r.ltv == null) ? "n/a" : `${Math.round(r.ltv * 100)}%`;
+    lines.push(
+      `${r.symbol.padEnd(10)} net ${pct(r.net)} | s ${pct(r.supplyApy)} | b ${pct(r.borrowApy)} | LTV ${ltvTxt} | ${r.project}`
+    );
+  }
+
+  out.textContent = lines.join("\n");
 }
 </script>
 
