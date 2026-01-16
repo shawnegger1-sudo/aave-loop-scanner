@@ -1,95 +1,344 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Aave Loop Scanner</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aave Loop Scanner (Simple)</title>
 </head>
-<body style="font-family:Arial; padding:20px;">
-  <h2>Aave Loop Scanner (ETH mainnet)</h2>
+<body style="font-family: Arial, sans-serif; padding: 20px;">
+  <h2>Aave Loop Scanner (Simple)</h2>
+  <p>
+    One button. Pulls Aave data from <code>https://api.v3.aave.com/graphql</code>, then prints the top same-asset loops.
+  </p>
 
-  <button onclick="run()" style="padding:10px 14px; font-size:16px;">
+  <button id="runBtn" style="padding:10px 14px; font-size:16px; cursor:pointer;">
     Run analysis
   </button>
 
-  <pre id="out" style="margin-top:15px; white-space:pre-wrap;"></pre>
+  <pre id="out" style="margin-top:15px; white-space:pre-wrap; background:#f6f8fa; padding:12px; border-radius:8px;"></pre>
 
 <script>
+const ENDPOINT = "https://api.v3.aave.com/graphql";
+const CHAIN_ID = 1;     // Ethereum mainnet
+const LEVERAGE = 3;     // 3x leverage (simple model)
+const TOP_N = 20;
+
+const out = document.getElementById("out");
+const btn = document.getElementById("runBtn");
+
+async function gql(query, variables) {
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables })
+  });
+  const json = await res.json();
+  return json;
+}
+
+function unwrapType(t) {
+  let cur = t;
+  while (cur && (cur.kind === "NON_NULL" || cur.kind === "LIST")) cur = cur.ofType;
+  return cur || null;
+}
+
+function pickExistingFields(typeObj, desired) {
+  if (!typeObj || !typeObj.fields) return [];
+  const existing = new Set(typeObj.fields.map(f => f.name));
+  return desired.filter(d => existing.has(d));
+}
+
+function findType(schema, name) {
+  return schema.__schema.types.find(t => t.name === name);
+}
+
+function safeNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getSupplyApy(reserve) {
+  const si = reserve?.supplyInfo || {};
+  // common candidates (schema may vary)
+  const cands = [si.apy, si.supplyAPY];
+  for (const v of cands) {
+    const n = safeNum(v);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
+function getBorrowApy(reserve) {
+  const bi = reserve?.borrowInfo || {};
+  const cands = [bi.apy, bi.borrowAPY, bi.variableBorrowAPY];
+  for (const v of cands) {
+    const n = safeNum(v);
+    if (n !== null) return n;
+  }
+  // nested rates (if present)
+  const nested = safeNum(bi?.rates?.apy || bi?.rates?.variableAPY || bi?.rates?.stableAPY);
+  return nested !== null ? nested : null;
+}
+
+function computeNetApy(supplyApy, borrowApy, L) {
+  // equity=1, total supply=L, total borrow=(L-1)
+  // net = supplyApy*L - borrowApy*(L-1)
+  if (supplyApy === null || borrowApy === null) return null;
+  return supplyApy * L - borrowApy * (L - 1);
+}
+
 async function run() {
-  const out = document.getElementById("out");
-  out.textContent = "Fetching Aave data...";
+  out.textContent = "Step 1/3: Inspecting Aave GraphQL schema (introspection)...";
 
-  try {
-    const res = await fetch("https://api.v3.aave.com/graphql", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        query: `
-          query {
-            aaveV3Pools {
-              chainId
-              name
-              reserves {
-                symbol
-                supplyAPY
-                variableBorrowAPY
-              }
-            }
+  // Introspection query (to discover the correct markets query + fields)
+  const introspectionQuery = `
+    query Introspect {
+      __schema {
+        queryType {
+          fields {
+            name
+            args { name type { kind name ofType { kind name ofType { kind name } } } }
+            type { kind name ofType { kind name ofType { kind name } } }
           }
-        `
-      })
-    });
-
-    const json = await res.json();
-
-    if (json.errors) {
-      out.textContent =
-        "GraphQL error:\\n\\n" +
-        json.errors.map(e => e.message).join("\\n");
-      return;
+        }
+        types {
+          name
+          kind
+          fields {
+            name
+            type { kind name ofType { kind name ofType { kind name } } }
+          }
+          inputFields {
+            name
+            type { kind name ofType { kind name ofType { kind name } } }
+          }
+        }
+      }
     }
+  `;
 
-    const pools = json.data?.aaveV3Pools;
-    if (!pools) {
-      out.textContent =
-        "No data returned:\\n\\n" +
-        JSON.stringify(json, null, 2);
-      return;
+  const intro = await gql(introspectionQuery, {});
+  if (intro.errors && intro.errors.length) {
+    out.textContent = "GraphQL error during introspection:\n\n" + intro.errors.map(e => e.message).join("\n");
+    return;
+  }
+  const schema = intro.data;
+
+  // Find a query field that returns a "Market-like" type (must have supplyReserves & borrowReserves)
+  const qFields = schema.__schema.queryType.fields;
+
+  function unwrapNamed(typeObj) {
+    const u = unwrapType(typeObj);
+    return u ? u.name : null;
+  }
+
+  let marketsField = null;
+  let marketTypeName = null;
+
+  for (const f of qFields) {
+    const tName = unwrapNamed(f.type);
+    if (!tName) continue;
+
+    const t = findType(schema, tName);
+    if (!t || !t.fields) continue;
+
+    const names = new Set(t.fields.map(x => x.name));
+    if (names.has("supplyReserves") && names.has("borrowReserves")) {
+      marketsField = f;
+      marketTypeName = tName;
+      break;
     }
+  }
 
-    const L = 3; // 3x leverage
-    const rows = [];
+  // If not found directly, try common names
+  if (!marketsField) {
+    marketsField = qFields.find(f => f.name === "markets" || f.name === "aaveMarkets" || f.name === "aaveV3Markets");
+    if (marketsField) {
+      marketTypeName = unwrapNamed(marketsField.type);
+    }
+  }
 
-    for (const pool of pools) {
-      if (pool.chainId !== 1) continue; // Ethereum only
+  if (!marketsField || !marketTypeName) {
+    out.textContent =
+      "Could not find a Markets query field in the schema.\n\n" +
+      "This means the API schema has changed significantly.\n" +
+      "Open https://api.v3.aave.com/ in your browser (GraphQL playground) to verify available query fields.";
+    return;
+  }
 
-      for (const r of pool.reserves) {
-        const sApy = Number(r.supplyAPY);
-        const bApy = Number(r.variableBorrowAPY);
+  // Build a markets query selection set based on fields that exist
+  const MarketT = findType(schema, marketTypeName);
+  const supplyField = (MarketT.fields || []).find(x => x.name === "supplyReserves");
+  const reserveTypeName = unwrapNamed(supplyField.type);
+  const ReserveT = findType(schema, reserveTypeName);
 
-        if (!isFinite(sApy) || !isFinite(bApy)) continue;
+  const underlyingField = (ReserveT.fields || []).find(x => x.name === "underlyingToken");
+  const currencyTypeName = underlyingField ? unwrapNamed(underlyingField.type) : null;
+  const CurrencyT = currencyTypeName ? findType(schema, currencyTypeName) : null;
 
-        const net = sApy * L - bApy * (L - 1);
+  const SupplyInfoT = (() => {
+    const f = (ReserveT.fields || []).find(x => x.name === "supplyInfo");
+    return f ? findType(schema, unwrapNamed(f.type)) : null;
+  })();
 
-        rows.push({
-          market: pool.name,
-          asset: r.symbol,
-          net
+  const BorrowInfoT = (() => {
+    const f = (ReserveT.fields || []).find(x => x.name === "borrowInfo");
+    return f ? findType(schema, unwrapNamed(f.type)) : null;
+  })();
+
+  const currencyFields = pickExistingFields(CurrencyT, ["symbol","address","name","decimals","imageUrl"]);
+  const supplyInfoFields = pickExistingFields(SupplyInfoT, ["apy","supplyAPY"]);
+  const borrowInfoFields = pickExistingFields(BorrowInfoT, ["apy","borrowAPY","variableBorrowAPY"]);
+
+  // If borrowInfo has nested "rates", include a minimal selection if present
+  let borrowRatesSel = "";
+  if (BorrowInfoT && (BorrowInfoT.fields || []).some(f => f.name === "rates")) {
+    const ratesTypeName = unwrapNamed(BorrowInfoT.fields.find(f => f.name === "rates").type);
+    const RatesT = findType(schema, ratesTypeName);
+    const rf = pickExistingFields(RatesT, ["apy","variableAPY","stableAPY"]);
+    if (rf.length) borrowRatesSel = ` rates { ${rf.join(" ")} }`;
+  }
+
+  // Market fields we display
+  const marketFields = pickExistingFields(MarketT, ["name","address"]);
+  const hasChain = (MarketT.fields || []).some(f => f.name === "chain");
+  let chainSel = "";
+  if (hasChain) {
+    const chainTypeName = unwrapNamed(MarketT.fields.find(f => f.name === "chain").type);
+    const ChainT = findType(schema, chainTypeName);
+    const chainFields = pickExistingFields(ChainT, ["name","chainId"]);
+    if (chainFields.length) chainSel = `chain { ${chainFields.join(" ")} }`;
+  }
+
+  const reserveSel = `
+    underlyingToken { ${currencyFields.join(" ")} }
+    supplyInfo { ${supplyInfoFields.join(" ")} }
+    borrowInfo { ${borrowInfoFields.join(" ")} ${borrowRatesSel} }
+  `;
+
+  const selection = `
+    ${marketFields.join(" ")}
+    ${chainSel}
+    supplyReserves { ${reserveSel} }
+    borrowReserves { ${reserveSel} }
+  `;
+
+  // Figure out the correct argument shape for chainIds if supported
+  const args = marketsField.args || [];
+  let argStr = ""; // (request:{chainIds:[1]}) etc.
+
+  const hasChainIdsDirect = args.some(a => a.name === "chainIds");
+  const hasRequestArg = args.some(a => a.name === "request");
+
+  if (hasChainIdsDirect) {
+    argStr = `(chainIds: [${CHAIN_ID}])`;
+  } else if (hasRequestArg) {
+    argStr = `(request: { chainIds: [${CHAIN_ID}] })`;
+  } else {
+    // try any input arg that contains chainIds
+    for (const a of args) {
+      const tName = unwrapNamed(a.type);
+      const inputT = findType(schema, tName);
+      if (inputT && inputT.inputFields && inputT.inputFields.some(f => f.name === "chainIds")) {
+        argStr = `(${a.name}: { chainIds: [${CHAIN_ID}] })`;
+        break;
+      }
+    }
+  }
+
+  out.textContent = `Step 2/3: Fetching markets using query field "${marketsField.name}" on chainId ${CHAIN_ID}...`;
+
+  const marketsQuery = `
+    query GetMarkets {
+      ${marketsField.name}${argStr} {
+        ${selection}
+      }
+    }
+  `;
+
+  const resp = await gql(marketsQuery, {});
+  if (resp.errors && resp.errors.length) {
+    out.textContent =
+      "GraphQL error fetching markets:\n\n" +
+      resp.errors.map(e => e.message).join("\n") +
+      "\n\n(If you want, paste this error here and I’ll tailor the query.)";
+    return;
+  }
+
+  const markets = resp.data?.[marketsField.name];
+  if (!markets) {
+    out.textContent = "No markets returned.\n\nFull response:\n" + JSON.stringify(resp, null, 2);
+    return;
+  }
+
+  out.textContent = `Step 3/3: Computing same-asset loops at ${LEVERAGE}x...`;
+
+  const results = [];
+
+  for (const m of markets) {
+    // If chain info exists, enforce CHAIN_ID (sometimes arg filter not supported)
+    const cid = Number(m?.chain?.chainId ?? CHAIN_ID);
+    if (cid !== CHAIN_ID) continue;
+
+    const marketName = m?.name || "Unknown Market";
+
+    for (const s of (m.supplyReserves || [])) {
+      const symS = s?.underlyingToken?.symbol;
+      if (!symS) continue;
+
+      const sApy = getSupplyApy(s);
+      if (sApy === null) continue;
+
+      // Find matching borrow reserve by symbol (same-asset loop)
+      for (const b of (m.borrowReserves || [])) {
+        const symB = b?.underlyingToken?.symbol;
+        if (!symB || symB !== symS) continue;
+
+        const bApy = getBorrowApy(b);
+        if (bApy === null) continue;
+
+        const net = computeNetApy(sApy, bApy, LEVERAGE);
+        if (net === null) continue;
+
+        results.push({
+          market: marketName,
+          asset: symS,
+          supplyApy: sApy,
+          borrowApy: bApy,
+          netApy: net
         });
       }
     }
-
-    rows.sort((a,b)=>b.net-a.net);
-
-    out.textContent =
-      "Top same-asset loops (3x leverage):\\n\\n" +
-      rows.slice(0,15).map(r =>
-        `${r.market} | ${r.asset} | ${(r.net*100).toFixed(2)}%`
-      ).join("\\n");
-
-  } catch (e) {
-    out.textContent = "Browser/network error:\\n" + e.message;
   }
+
+  results.sort((a,b) => (b.netApy - a.netApy));
+
+  if (!results.length) {
+    out.textContent =
+      "No loop candidates found.\n\n" +
+      "This usually means the API returned markets but the APY fields were named differently.\n" +
+      "Reply with the full output of this page (or a screenshot) and I’ll adjust it.";
+    return;
+  }
+
+  const lines = [];
+  lines.push(`Top ${Math.min(TOP_N, results.length)} same-asset loops (${LEVERAGE}x) — simple net APY model`);
+  lines.push("");
+  for (const r of results.slice(0, TOP_N)) {
+    lines.push(
+      `${r.market} | ${r.asset} | net ${(r.netApy*100).toFixed(2)}%` +
+      ` (s ${(r.supplyApy*100).toFixed(2)}% / b ${(r.borrowApy*100).toFixed(2)}%)`
+    );
+  }
+
+  out.textContent = lines.join("\n");
 }
+
+btn.addEventListener("click", () => {
+  run().catch(e => {
+    out.textContent = "Unexpected error:\n" + e.message;
+  });
+});
 </script>
 </body>
 </html>
